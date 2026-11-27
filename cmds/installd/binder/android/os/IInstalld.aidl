@@ -216,6 +216,31 @@ interface IInstalld {
             @utf8InCpp String toPath, int userId, int appId, @utf8InCpp String seInfo, int flags,
             int callerUid, IAppDataOperationCallback callback);
 
+    /**
+     * Overwrites every *emoji*.ttf the app owns in its CE and DE data with the font in
+     * fontFd, then writes it to each of lockedFiles (paths relative to the CE data dir) as a
+     * root-owned read-only file. Returns the number of files written.
+     */
+    int replaceAppEmojiFonts(@nullable @utf8InCpp String uuid, @utf8InCpp String packageName,
+            int userId, int appId, in ParcelFileDescriptor fontFd,
+            in @utf8InCpp String[] lockedFiles);
+
+    /**
+     * Undoes replaceAppEmojiFonts: deletes every *emoji*.ttf the app owns in its CE and DE data,
+     * and each of lockedFiles (paths relative to the CE data dir) when it is a root-owned file,
+     * so the app fetches its own emoji font again. Returns the number of files removed.
+     */
+    int removeAppEmojiFonts(@nullable @utf8InCpp String uuid, @utf8InCpp String packageName,
+            int userId, int appId, in @utf8InCpp String[] lockedFiles);
+
+    /**
+     * Empties a directory relative to the app's CE data dir. With block, the directory is
+     * created if missing and left root-owned mode 000 so the app can't write into it. Without
+     * block, a directory blocked this way is handed back to the app.
+     */
+    void clearAppDataSubdir(@nullable @utf8InCpp String uuid, @utf8InCpp String packageName,
+            int userId, int appId, @utf8InCpp String relativePath, boolean block);
+
     const int FLAG_STORAGE_DE = 0x1;
     const int FLAG_STORAGE_CE = 0x2;
     const int FLAG_STORAGE_EXTERNAL = 0x4;

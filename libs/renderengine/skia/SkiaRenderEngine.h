@@ -182,6 +182,7 @@ protected:
 
 private:
     virtual SkiaBackend backend() const = 0;
+    virtual bool isVulkan() const { return false; }
 
     void mapExternalTextureBuffer(const sp<GraphicBuffer>& buffer,
                                   bool isRenderable) override final;
@@ -253,6 +254,10 @@ private:
 
     sp<Fence> mLastDrawFence;
     BlurFilter* mBlurFilter = nullptr;
+    // Offscreen layer for blurs below the max cross-fade radius, reused across frames.
+    sk_sp<SkSurface> mCompositionLayerSurface;
+    // Copy of the destination used as the input of an upper blur layer that cross-fades with it.
+    sk_sp<SkSurface> mBlurInputCopySurface;
 
     // Object to capture commands send to Skia.
     std::unique_ptr<SkiaCapture> mCapture;

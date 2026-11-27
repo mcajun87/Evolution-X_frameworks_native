@@ -934,6 +934,8 @@ void chooseRenderEngineType(renderengine::RenderEngineCreationArgs::Builder& bui
 /**
  * Choose a suggested blurring algorithm if supportsBlur is true. By default Kawase will be
  * suggested as it's faster than a full Gaussian blur and looks close enough.
+ * A low end device, which sets ro.evolution.glass_low_end or has little RAM, gets KawaseDarkmoon
+ * by default, as it is lighter on the GPU.
  */
 renderengine::RenderEngine::BlurAlgorithm chooseBlurAlgorithm(bool supportsBlur) {
     if (!supportsBlur) {
@@ -946,6 +948,12 @@ renderengine::RenderEngine::BlurAlgorithm chooseBlurAlgorithm(bool supportsBlur)
     } else if (algorithm == "kawase") {
         return renderengine::RenderEngine::BlurAlgorithm::Kawase;
     } else if (algorithm == "kawase_darkmoon") {
+        return renderengine::RenderEngine::BlurAlgorithm::KawaseDarkmoon;
+    } else if (algorithm.empty() &&
+               base::GetBoolProperty("ro.evolution.glass_low_end"s,
+                                     base::GetBoolProperty("ro.config.low_ram"s, false))) {
+        // KawaseDarkmoon is the lighter filter, made for weak GPUs, so a device that holds the
+        // glass back, or has little RAM, uses it unless it sets an algorithm of its own.
         return renderengine::RenderEngine::BlurAlgorithm::KawaseDarkmoon;
     } else {
         return renderengine::RenderEngine::BlurAlgorithm::KawaseDualFilterV2;
@@ -1849,12 +1857,17 @@ void SurfaceFlinger::disableExpensiveRendering() {
     const char* const whence = __func__;
     auto future = mScheduler->schedule([=, this]() FTL_FAKE_GUARD(mStateLock) {
         SFTRACE_NAME(whence);
+        // A newer composite asked for it again and re-armed the expiry timer
+        if (mPowerAdvisor->isExpensiveRenderingHeld()) {
+            return;
+        }
         if (mPowerAdvisor->isUsingExpensiveRendering()) {
             for (const auto& [_, display] : mDisplays) {
                 constexpr bool kDisable = false;
                 mPowerAdvisor->setExpensiveRenderingExpected(display->getId(), kDisable);
             }
         }
+        mPowerAdvisor->expireExpensiveRendering();
     });
 
     future.wait();
@@ -1914,6 +1927,8 @@ status_t SurfaceFlinger::setActiveColorMode(const sp<IBinder>& displayToken, ui:
 
         display->getCompositionDisplay()->setColorProfile(
                 {mode, Dataspace::UNKNOWN, RenderIntent::COLORIMETRIC});
+        mContentGeneration++;
+        scheduleSample();
 
         return NO_ERROR;
     });
@@ -2417,6 +2432,9 @@ status_t SurfaceFlinger::setDisplayBrightness(const sp<IBinder>& displayToken,
                        FTL_FAKE_GUARD(kMainThreadContext,
                                       display->updateHdrSdrRatioOverlayRatio(currentHdrSdrRatio));
 
+                       // Screenshots, and so region sampling, depend on the brightness
+                       mContentGeneration++;
+                       scheduleSample();
                        if (brightness.sdrWhitePointNits / brightness.displayBrightnessNits !=
                            currentDimmingRatio) {
                            scheduleComposite(FrameHint::kNone);
@@ -2537,6 +2555,7 @@ void SurfaceFlinger::scheduleComposite(FrameHint hint) {
 
 void SurfaceFlinger::scheduleRepaint() {
     mGeometryDirty = true;
+    mContentGeneration++;
     scheduleComposite(FrameHint::kActive);
 }
 
@@ -3151,10 +3170,14 @@ bool SurfaceFlinger::commit(PhysicalDisplayId pacesetterId,
 
         const bool flushTransactions = clearTransactionFlags(eTransactionFlushNeeded);
         bool transactionsAreEmpty = false;
-        mustComposite |=
+        const bool contentChanged =
                 updateLayerSnapshots(vsyncId, pacesetterFrameTargetPtr->frameBeginTime().ns(),
                                      pacesetterFrameTargetPtr->expectedPresentTime().ns(),
                                      flushTransactions, transactionsAreEmpty);
+        if (contentChanged) {
+            mContentGeneration++;
+        }
+        mustComposite |= contentChanged;
 
         // A display transaction for hotplug reconnect may have just destroyed the original.
         pacesetterFrameTargetPtr = mScheduler->pacesetterFrameTarget();
@@ -9538,7 +9561,7 @@ void SurfaceFlinger::sample() {
     const auto scheduleFrameTimeOpt = scheduledFrameResultOpt
             ? std::optional{scheduledFrameResultOpt->callbackTime}
             : std::nullopt;
-    mRegionSamplingThread->onCompositionComplete(scheduleFrameTimeOpt);
+    mRegionSamplingThread->onCompositionComplete(scheduleFrameTimeOpt, mContentGeneration);
 }
 
 sp<DisplayDevice> SurfaceFlinger::findFrontInternalDisplay() const FTL_FAKE_GUARD(mStateLock) {
@@ -9558,6 +9581,8 @@ void SurfaceFlinger::onNewFrontInternalDisplay(const DisplayDevice* oldFrontInte
     SFTRACE_CALL();
 
     mFrontInternalDisplayId = newFrontInternalDisplay.getPhysicalId();
+    // Region sampling captures the front internal display
+    mContentGeneration++;
 
     mFrontInternalDisplayTransformHint = newFrontInternalDisplay.getTransformHint();
     sFrontInternalDisplayRotationFlags =

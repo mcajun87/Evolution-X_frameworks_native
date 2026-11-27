@@ -84,6 +84,7 @@
 #include "ShaderCache.h"
 #include "compat/SkiaGpuContext.h"
 #include "filters/BlurFilter.h"
+#include "filters/DolbyVisionShader.h"
 #include "filters/GainmapFactory.h"
 #include "filters/GaussianBlurFilter.h"
 #include "filters/KawaseBlurDualFilterV2.h"
@@ -383,6 +384,8 @@ void SkiaRenderEngine::finishRenderingAndAbandonContexts() {
     // before ~SkiaGpuContext is called.
     mTextureCleanupMgr.setDeferredStatus(false);
     mTextureCleanupMgr.cleanup();
+    mCompositionLayerSurface.reset();
+    mBlurInputCopySurface.reset();
 
     // ~SkiaGpuContext must be called before GPU API contexts are torn down.
     mContext.reset();
@@ -394,6 +397,11 @@ void SkiaRenderEngine::useProtectedContext(bool useProtectedContext) {
         (useProtectedContext && !supportsProtectedContent())) {
         return; // No context switch is required
     }
+
+    // Release the cached surface while its owning context is still active. Graphite surfaces
+    // have no recordingContext(), so that comparison alone cannot detect a context switch.
+    mCompositionLayerSurface.reset();
+    mBlurInputCopySurface.reset();
 
     // If the active context's cache management policy is to get rid of purgeable resources upon
     // switching contexts, then handle doing so here.
@@ -668,7 +676,22 @@ sk_sp<SkShader> SkiaRenderEngine::createRuntimeEffectShader(
         }
     }
 
-    if (parameters.requiresLinearEffect) {
+    // Dolby Vision frames need the vendor reshaping, which replaces the linear effect.
+    bool usedDolbyVision = false;
+    if (graphicBuffer && !usedAgtm && !parameters.layer.luts) {
+        if (auto dolbyShader = DolbyVisionShader::getInstance().create(shader, parameters.layer,
+                                                                       parameters.display,
+                                                                       graphicBuffer,
+                                                                       parameters.outputDataSpace,
+                                                                       parameters.layerDimmingRatio,
+                                                                       isVulkan(),
+                                                                       parameters.colorSpaceOptions)) {
+            shader = std::move(dolbyShader);
+            usedDolbyVision = true;
+        }
+    }
+
+    if (parameters.requiresLinearEffect && !usedDolbyVision) {
         const auto format = targetBuffer != nullptr
                 ? std::optional<ui::PixelFormat>(
                           static_cast<ui::PixelFormat>(targetBuffer->getPixelFormat()))
@@ -1006,7 +1029,18 @@ void SkiaRenderEngine::drawLayersInternal(
                 }
             }
             if (requiresCompositionLayer) {
-                activeSurface = dstSurface->makeSurface(dstSurface->imageInfo());
+                // Keep the surface across frames to avoid reallocating it during blur fades
+                // when Skia's resource cache is full.
+                if (!mCompositionLayerSurface ||
+                    mCompositionLayerSurface->imageInfo() != dstSurface->imageInfo() ||
+                    mCompositionLayerSurface->recordingContext() !=
+                            dstSurface->recordingContext()) {
+                    mCompositionLayerSurface = dstSurface->makeSurface(dstSurface->imageInfo());
+                }
+                // Switching away from this layer below does not restore its canvas, so drop
+                // what the previous frame left on it.
+                mCompositionLayerSurface->getCanvas()->restoreToCount(1);
+                activeSurface = mCompositionLayerSurface;
                 canvas = mCapture->tryOffscreenCapture(activeSurface.get(), &offscreenCaptureState);
                 blurCompositionLayer = &layer;
                 break;
@@ -1157,8 +1191,27 @@ void SkiaRenderEngine::drawLayersInternal(
                     if (requiresCrossFadeWithBlurInput) {
                         // If we require cross fading with the blur input, we need to make sure we
                         // make a copy of the surface to the image since we will be writing to the
-                        // surface while sampling the blurInput.
-                        blurInput = activeSurface->makeImageSnapshot();
+                        // surface while sampling the blurInput. Copy into a surface kept across
+                        // frames: a snapshot would be copied on write into a freshly allocated
+                        // full-screen image every frame, which stalls RenderEngine for several ms.
+                        if (!mBlurInputCopySurface ||
+                            mBlurInputCopySurface->imageInfo() != activeSurface->imageInfo() ||
+                            mBlurInputCopySurface->recordingContext() !=
+                                    activeSurface->recordingContext()) {
+                            mBlurInputCopySurface =
+                                    activeSurface->makeSurface(activeSurface->imageInfo());
+                        }
+                        if (mBlurInputCopySurface) {
+                            SkPaint copyPaint;
+                            copyPaint.setBlendMode(SkBlendMode::kSrc);
+                            SkCanvas* copyCanvas = mBlurInputCopySurface->getCanvas();
+                            copyCanvas->restoreToCount(1);
+                            copyCanvas->drawImage(activeSurface->makeTemporaryImage(), 0, 0,
+                                                  SkSamplingOptions(), &copyPaint);
+                            blurInput = mBlurInputCopySurface->makeTemporaryImage();
+                        } else {
+                            blurInput = activeSurface->makeImageSnapshot();
+                        }
                     } else {
                         blurInput = activeSurface->makeTemporaryImage();
                     }
@@ -1230,15 +1283,20 @@ void SkiaRenderEngine::drawLayersInternal(
                     // the regions themselves, plus the blur radius around them so their edges
                     // still see the content next to them. Blurring the whole layer instead costs
                     // a full screen pass for every radius, e.g. for small Liquid Glass tiles over
-                    // a shade that blurs at a different radius.
+                    // a shade that blurs at a different radius. Glass that refracts sees
+                    // further out, as far as its rim reaches.
                     for (const auto& [radius, regions] : regionsPerRadius) {
                         SkRect regionsRect = SkRect::MakeEmpty();
-                        for (const BlurRegion& region : regions) {
-                            regionsRect.join(
-                                    canvas->getTotalMatrix().mapRect(getBlurRRect(region).rect()));
-                        }
                         const float margin = canvas->getTotalMatrix().mapRadius(radius);
-                        regionsRect.outset(margin, margin);
+                        for (const BlurRegion& region : regions) {
+                            const SkRRect rrect = getBlurRRect(region);
+                            SkRect rect = canvas->getTotalMatrix().mapRect(rrect.rect());
+                            const float reach = canvas->getTotalMatrix().mapRadius(
+                                    mBlurFilter->lensReach(rrect, region.material));
+                            const float outset = std::max(margin, reach);
+                            rect.outset(outset, outset);
+                            regionsRect.join(rect);
+                        }
                         SkRect regionsBlurRect = blurRect;
                         if (!regionsBlurRect.intersect(regionsRect)) {
                             continue;

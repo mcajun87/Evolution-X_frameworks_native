@@ -20,6 +20,7 @@
 #include <errno.h>
 #include <fts.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <linux/fsverity.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -66,6 +67,7 @@
 #include <private/android_filesystem_config.h>
 #include <private/android_projectid_config.h>
 #include <selinux/android.h>
+#include <selinux/selinux.h>
 #include <system/thread_defs.h>
 #include <utils/Trace.h>
 
@@ -431,52 +433,56 @@ using PackageLockGuard = std::lock_guard<PackageLock>;
 #endif // GRANULAR_LOCKS
 
 static constexpr size_t kTarBlock = 512;
+static constexpr size_t kTarMaxPathBytes = 4095;
 
-static void tarPutOctal(char* field, size_t len, uint64_t value) {
+static void tarPutNumber(char* field, size_t len, uint64_t value) {
+    if (len == 12 && value >= (uint64_t{1} << 33)) {
+        memset(field, 0, len);
+        for (size_t i = len - 1; i > 0; --i) {
+            field[i] = static_cast<char>(value & 0xff);
+            value >>= 8;
+        }
+        field[0] = static_cast<char>(0x80);
+        return;
+    }
     snprintf(field, len, "%0*llo", static_cast<int>(len - 1),
              static_cast<unsigned long long>(value));
 }
 
 static bool tarWriteHeader(int fd, const std::string& path, uint64_t size, char type,
                            time_t mtime) {
+    if (path.empty() || path.size() > kTarMaxPathBytes ||
+            path.find('\0') != std::string::npos) return false;
     std::string name = path;
     std::string prefix;
-
-    const bool isDir = (!name.empty() && name.back() == '/');
-    if (isDir) name.pop_back();
-
-    if (name.size() > 99) {
-        const size_t splitAt = name.find('/', name.size() - 100);
-        if (splitAt == std::string::npos) {
-            LOG(WARNING) << "tarAppData: path too long for ustar, skipping (" << name.size()
-                         << " bytes): " << name;
-            return false;
+    if (name.size() > 100) {
+        size_t splitAt = name.rfind('/', name.size() - 2);
+        while (splitAt != std::string::npos && splitAt > 155) {
+            splitAt = name.rfind('/', splitAt - 1);
         }
-        prefix = name.substr(0, splitAt);
-        name   = name.substr(splitAt + 1);
-        if (name.size() > 99 || prefix.size() > 154) {
-            LOG(WARNING) << "tarAppData: path split failed (name=" << name.size()
-                         << " prefix=" << prefix.size() << "), skipping: " << path;
-            return false;
+        if (splitAt != std::string::npos && splitAt > 0 && name.size() - splitAt - 1 <= 100) {
+            prefix = name.substr(0, splitAt);
+            name = name.substr(splitAt + 1);
+        } else {
+            const size_t bytes = path.size() + 1;
+            char padding[kTarBlock] = {};
+            if (!tarWriteHeader(fd, "././@LongLink", bytes, 'L', 0) ||
+                    !android::base::WriteFully(fd, path.c_str(), bytes) ||
+                    !android::base::WriteFully(fd, padding,
+                            (kTarBlock - bytes % kTarBlock) % kTarBlock)) return false;
+            name = "././@LongLink";
         }
     }
 
-    char hdr[kTarBlock];
-    memset(hdr, 0, sizeof(hdr));
+    char hdr[kTarBlock] = {};
+    memcpy(hdr, name.data(), name.size());
+    memcpy(hdr + 345, prefix.data(), prefix.size());
 
-    if (isDir) {
-        memcpy(hdr, name.c_str(), name.size());
-        hdr[name.size()] = '/';
-    } else {
-        memcpy(hdr, name.c_str(), name.size());
-    }
-    if (!prefix.empty()) memcpy(hdr + 345, prefix.c_str(), prefix.size());
-
-    tarPutOctal(hdr + 100, 8, type == '5' ? 0755 : 0644);
-    tarPutOctal(hdr + 108, 8, 0);
-    tarPutOctal(hdr + 116, 8, 0);
-    tarPutOctal(hdr + 124, 12, size);
-    tarPutOctal(hdr + 136, 12, static_cast<uint64_t>(mtime));
+    tarPutNumber(hdr + 100, 8, type == '5' ? 0755 : 0644);
+    tarPutNumber(hdr + 108, 8, 0);
+    tarPutNumber(hdr + 116, 8, 0);
+    tarPutNumber(hdr + 124, 12, size);
+    tarPutNumber(hdr + 136, 12, static_cast<uint64_t>(mtime));
     hdr[156] = type;
     memcpy(hdr + 257, "ustar", 5);
     memcpy(hdr + 263, "00", 2);
@@ -484,25 +490,28 @@ static bool tarWriteHeader(int fd, const std::string& path, uint64_t size, char 
     memset(hdr + 148, ' ', 8);
     unsigned int sum = 0;
     for (size_t i = 0; i < kTarBlock; i++) sum += static_cast<unsigned char>(hdr[i]);
-    tarPutOctal(hdr + 148, 8, sum);
+    tarPutNumber(hdr + 148, 8, sum);
 
     return android::base::WriteFully(fd, hdr, kTarBlock);
 }
 
-static constexpr uint64_t kTarMaxFileSize  = (uint64_t)4  * 1024 * 1024 * 1024;
-static constexpr uint64_t kTarMaxTotalSize = (uint64_t)8  * 1024 * 1024 * 1024;
+static constexpr uint64_t kTarMaxFileSize  = uint64_t{1} << 40;
+static constexpr uint64_t kTarMaxTotalSize = uint64_t{1} << 40;
 static constexpr uint32_t kTarMaxEntries   = 100000;
 
 static int tarTree(int fd, const std::string& path, const std::string& rel,
-                   bool excludeCache, bool topLevel, std::vector<char>& ioBuf) {
+                   bool excludeCache, bool topLevel, std::vector<char>& ioBuf,
+                   uint32_t& entryCount, uint64_t& totalSize) {
     std::unique_ptr<DIR, int (*)(DIR*)> dir(opendir(path.c_str()), closedir);
     if (dir == nullptr) {
         PLOG(WARNING) << "tarAppData: opendir failed for " << path;
         return -errno;
     }
 
-    struct dirent* de;
-    while ((de = readdir(dir.get())) != nullptr) {
+    while (true) {
+        errno = 0;
+        struct dirent* de = readdir(dir.get());
+        if (de == nullptr) return errno == 0 ? 0 : -errno;
         const char* nm = de->d_name;
         if (!strcmp(nm, ".") || !strcmp(nm, "..")) continue;
 
@@ -514,43 +523,41 @@ static int tarTree(int fd, const std::string& path, const std::string& rel,
         const std::string childPath = path + "/" + nm;
         const std::string childRel = rel.empty() ? std::string(nm) : (rel + "/" + nm);
 
-        if (childRel.size() > 254) {
-            LOG(WARNING) << "tarAppData: skipping path > 254 bytes: " << childRel;
-            continue;
-        }
+        if (childRel.size() > kTarMaxPathBytes) return -ENAMETOOLONG;
 
         struct stat sb;
         if (lstat(childPath.c_str(), &sb) != 0) {
             PLOG(WARNING) << "tarAppData: lstat failed for " << childPath;
-            continue;
+            return -errno;
         }
 
         if (S_ISLNK(sb.st_mode)) {
             continue;
         } else if (S_ISDIR(sb.st_mode)) {
+            if (++entryCount > kTarMaxEntries) return -EFBIG;
             if (!tarWriteHeader(fd, childRel + "/", 0, '5', sb.st_mtime)) {
                 LOG(WARNING) << "tarAppData: failed to write dir header for " << childRel;
-                continue;
+                return -EIO;
             }
-            const int rc = tarTree(fd, childPath, childRel, excludeCache, false, ioBuf);
+            const int rc = tarTree(fd, childPath, childRel, excludeCache, false, ioBuf,
+                                   entryCount, totalSize);
             if (rc != 0) return rc;
         } else if (S_ISREG(sb.st_mode)) {
             unique_fd in(open(childPath.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW));
             if (in < 0) {
                 const int err = errno;
-                if (err == ELOOP  ||
-                    err == EACCES ||
-                    err == ENOENT) {
-                    PLOG(WARNING) << "tarAppData: skipping " << childPath;
-                    continue;
-                }
                 PLOG(ERROR) << "tarAppData: fatal open error for " << childPath;
                 return -err;
             }
+            if (fstat(in.get(), &sb) != 0) return -errno;
+            if (!S_ISREG(sb.st_mode) || sb.st_size < 0) return -EINVAL;
             const uint64_t size = static_cast<uint64_t>(sb.st_size);
+            if (++entryCount > kTarMaxEntries || size > kTarMaxFileSize
+                    || size > kTarMaxTotalSize - totalSize) return -EFBIG;
+            totalSize += size;
             if (!tarWriteHeader(fd, childRel, size, '0', sb.st_mtime)) {
                 LOG(WARNING) << "tarAppData: failed to write file header for " << childRel;
-                continue;
+                return -EIO;
             }
 
             uint64_t remaining = size;
@@ -562,18 +569,14 @@ static int tarTree(int fd, const std::string& path, const std::string& rel,
                     PLOG(WARNING) << "tarAppData: read failed for " << childPath;
                     return -errno;
                 }
-                if (n == 0) break;
+                if (n == 0) return -EIO;
                 if (!android::base::WriteFully(fd, ioBuf.data(), n)) return -EIO;
                 remaining -= n;
             }
-            if (remaining > 0) {
-                std::fill(ioBuf.begin(), ioBuf.end(), 0);
-                while (remaining > 0) {
-                    const size_t chunk = (size_t)std::min<uint64_t>(ioBuf.size(), remaining);
-                    if (!android::base::WriteFully(fd, ioBuf.data(), chunk)) return -EIO;
-                    remaining -= chunk;
-                }
-            }
+            struct stat after;
+            if (fstat(in.get(), &after) != 0) return -errno;
+            if (after.st_size != sb.st_size || after.st_mtim.tv_sec != sb.st_mtim.tv_sec
+                    || after.st_mtim.tv_nsec != sb.st_mtim.tv_nsec) return -EIO;
             const size_t pad = (kTarBlock - (size % kTarBlock)) % kTarBlock;
             if (pad) {
                 char z[kTarBlock] = {0};
@@ -581,7 +584,6 @@ static int tarTree(int fd, const std::string& path, const std::string& rel,
             }
         }
     }
-    return 0;
 }
 
 }  // namespace
@@ -1512,6 +1514,366 @@ binder::Status InstalldNativeService::clearAppData(const std::optional<std::stri
     return res;
 }
 
+// Same match as the Magisk emoji modules: apps that bundle or download their own emoji font.
+static bool is_emoji_font_name(const std::string& name) {
+    std::string lower(name);
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+                   [](unsigned char c) { return static_cast<char>(::tolower(c)); });
+    return lower.find("emoji") != std::string::npos && base::EndsWith(lower, ".ttf");
+}
+
+static bool copy_font(int srcFd, int dstFd) {
+    char buf[64 * 1024];
+    off_t offset = 0;
+    while (true) {
+        ssize_t n = TEMP_FAILURE_RETRY(pread(srcFd, buf, sizeof(buf), offset));
+        if (n < 0) return false;
+        if (n == 0) return true;
+        if (!base::WriteFully(dstFd, buf, n)) return false;
+        offset += n;
+    }
+}
+
+static bool copy_label(int fromFd, int toFd) {
+    char* con = nullptr;
+    if (fgetfilecon(fromFd, &con) < 0) return false;
+    int res = fsetfilecon(toFd, con);
+    freecon(con);
+    return res == 0;
+}
+
+// Written beside the target and renamed over it: apps that have the old font mapped keep
+// their copy instead of faulting on a truncated file.
+static bool write_font_file(int dirFd, const std::string& name, int srcFd, uid_t owner, gid_t group,
+                            mode_t mode, int labelFromFd) {
+    const std::string tmp = "." + name + ".tmp";
+    unlinkat(dirFd, tmp.c_str(), 0);
+    unique_fd fd(openat(dirFd, tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+                        0600));
+    if (!fd.ok()) return false;
+    bool written = copy_font(srcFd, fd.get()) && fchown(fd.get(), owner, group) == 0 &&
+            fchmod(fd.get(), mode) == 0 && copy_label(labelFromFd, fd.get()) &&
+            renameat(dirFd, tmp.c_str(), dirFd, name.c_str()) == 0;
+    if (!written) unlinkat(dirFd, tmp.c_str(), 0);
+    return written;
+}
+
+static unique_fd make_app_dir(int parentFd, const std::string& name, uid_t uid) {
+    bool created = mkdirat(parentFd, name.c_str(), 0700) == 0;
+    if (!created && errno != EEXIST) return {};
+    unique_fd fd(openat(parentFd, name.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
+    if (!fd.ok()) return {};
+    if (created) {
+        if (fchown(fd.get(), uid, uid) < 0 || !copy_label(parentFd, fd.get())) return {};
+    } else {
+        struct stat st;
+        if (fstat(fd.get(), &st) < 0 || st.st_uid != uid) {
+            errno = EACCES;
+            return {};
+        }
+    }
+    return fd;
+}
+
+static std::vector<std::string> split_app_relative_path(const std::string& path) {
+    std::vector<std::string> parts = Split(path, "/");
+    for (const auto& part : parts) {
+        if (part.empty() || part == "." || part == "..") return {};
+    }
+    return parts;
+}
+
+// The app owns everything below its data dir, so no component is followed through a symlink.
+static unique_fd open_app_subdir(int baseFd, const std::vector<std::string>& parts, uid_t uid,
+                                 bool create) {
+    unique_fd cur(fcntl(baseFd, F_DUPFD_CLOEXEC, 0));
+    for (const auto& part : parts) {
+        if (!cur.ok()) break;
+        unique_fd next(
+                openat(cur.get(), part.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
+        if (!next.ok() && errno == ENOENT && create) next = make_app_dir(cur.get(), part, uid);
+        cur = std::move(next);
+    }
+    return cur;
+}
+
+static constexpr int kMaxEmojiFontDepth = 16;
+
+// Subdirectories, and regular files that look like an emoji font, directly inside dirFd.
+static std::vector<std::pair<std::string, unsigned char>> list_emoji_font_entries(int dirFd) {
+    std::vector<std::pair<std::string, unsigned char>> entries;
+    {
+        int listFd = fcntl(dirFd, F_DUPFD_CLOEXEC, 0);
+        std::unique_ptr<DIR, decltype(&closedir)> dir(listFd < 0 ? nullptr : fdopendir(listFd),
+                                                      closedir);
+        if (!dir) {
+            if (listFd >= 0) close(listFd);
+            return entries;
+        }
+        for (dirent* de = readdir(dir.get()); de != nullptr; de = readdir(dir.get())) {
+            if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
+            unsigned char type = de->d_type;
+            if (type == DT_UNKNOWN) {
+                // Not every filesystem fills in d_type.
+                struct stat st;
+                if (fstatat(dirFd, de->d_name, &st, AT_SYMLINK_NOFOLLOW) < 0) continue;
+                type = S_ISDIR(st.st_mode) ? DT_DIR : S_ISREG(st.st_mode) ? DT_REG : DT_UNKNOWN;
+            }
+            if (type == DT_DIR || (type == DT_REG && is_emoji_font_name(de->d_name))) {
+                entries.emplace_back(de->d_name, type);
+            }
+        }
+    }
+    return entries;
+}
+
+// The app's owner, mode and label are carried over to the new file.
+static int replace_emoji_fonts_in_dir(int dirFd, uid_t uid, int srcFd, int depth) {
+    if (depth > kMaxEmojiFontDepth) return 0;
+
+    auto entries = list_emoji_font_entries(dirFd);
+
+    int replaced = 0;
+    for (const auto& [name, type] : entries) {
+        if (type == DT_DIR) {
+            unique_fd sub(openat(dirFd, name.c_str(),
+                                 O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
+            if (sub.ok()) replaced += replace_emoji_fonts_in_dir(sub.get(), uid, srcFd, depth + 1);
+            continue;
+        }
+        // O_NONBLOCK: a FIFO swapped in after readdir must not hang installd.
+        unique_fd fd(openat(dirFd, name.c_str(), O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC));
+        struct stat st;
+        if (!fd.ok() || fstat(fd.get(), &st) < 0 || !S_ISREG(st.st_mode) || st.st_uid != uid) {
+            continue;
+        }
+        // Permission bits only; never carry setuid/setgid/sticky over.
+        if (write_font_file(dirFd, name, srcFd, st.st_uid, st.st_gid, st.st_mode & 0777,
+                            fd.get())) {
+            replaced++;
+        } else {
+            PLOG(WARNING) << "Failed to replace emoji font " << name;
+        }
+    }
+    return replaced;
+}
+
+// Undoes replace_emoji_fonts_in_dir: the app fetches or unpacks its own font again.
+static int remove_emoji_fonts_in_dir(int dirFd, uid_t uid, int depth) {
+    if (depth > kMaxEmojiFontDepth) return 0;
+
+    auto entries = list_emoji_font_entries(dirFd);
+
+    int removed = 0;
+    for (const auto& [name, type] : entries) {
+        if (type == DT_DIR) {
+            unique_fd sub(openat(dirFd, name.c_str(),
+                                 O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
+            if (sub.ok()) removed += remove_emoji_fonts_in_dir(sub.get(), uid, depth + 1);
+            continue;
+        }
+        struct stat st;
+        if (fstatat(dirFd, name.c_str(), &st, AT_SYMLINK_NOFOLLOW) < 0 || !S_ISREG(st.st_mode) ||
+            st.st_uid != uid) {
+            continue;
+        }
+        if (unlinkat(dirFd, name.c_str(), 0) == 0) {
+            removed++;
+        } else {
+            PLOG(WARNING) << "Failed to remove emoji font " << name;
+        }
+    }
+    return removed;
+}
+
+// root-owned and read-only, so the app can't rewrite it in place with a downloaded font.
+static bool lock_emoji_font(int parentFd, const std::string& name, uid_t uid, int srcFd) {
+    struct stat st;
+    if (fstatat(parentFd, name.c_str(), &st, AT_SYMLINK_NOFOLLOW) == 0 && !S_ISREG(st.st_mode)) {
+        errno = EEXIST;
+        return false;
+    }
+    return write_font_file(parentFd, name, srcFd, AID_ROOT, uid, 0444, parentFd);
+}
+
+binder::Status InstalldNativeService::replaceAppEmojiFonts(
+        const std::optional<std::string>& uuid, const std::string& packageName, int32_t userId,
+        int32_t appId, const ParcelFileDescriptor& fontFd,
+        const std::vector<std::string>& lockedFiles, int32_t* _aidl_return) {
+    ENFORCE_UID(AID_SYSTEM);
+    ENFORCE_VALID_USER(userId);
+    CHECK_ARGUMENT_UUID(uuid);
+    CHECK_ARGUMENT_PACKAGE_NAME(packageName);
+    // Only ordinary apps: system-uid data dirs are never touched.
+    CHECK_ARGUMENT_APP_ID(appId);
+    *_aidl_return = 0;
+
+    // Validate everything before writing anything, so a bad call changes nothing.
+    std::vector<std::vector<std::string>> lockedParts;
+    for (const auto& lockedFile : lockedFiles) {
+        std::vector<std::string> parts = split_app_relative_path(lockedFile);
+        if (parts.empty()) {
+            return exception(binder::Status::EX_ILLEGAL_ARGUMENT, "Bad path " + lockedFile);
+        }
+        lockedParts.push_back(std::move(parts));
+    }
+    const int srcFd = fontFd.get();
+    struct stat srcSt;
+    if (srcFd < 0 || fstat(srcFd, &srcSt) < 0 || !S_ISREG(srcSt.st_mode) || srcSt.st_size == 0) {
+        return exception(binder::Status::EX_ILLEGAL_ARGUMENT, "Font fd is not a regular file");
+    }
+
+    LOCK_PACKAGE_USER();
+
+    const char* uuid_ = uuid ? uuid->c_str() : nullptr;
+    const char* pkgname = packageName.c_str();
+    const uid_t uid = multiuser_get_uid(userId, appId);
+
+    const std::string cePath = create_data_user_ce_package_path(uuid_, userId, pkgname);
+    const std::string dePath = create_data_user_de_package_path(uuid_, userId, pkgname);
+    unique_fd ceFd(open(cePath.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
+    unique_fd deFd(open(dePath.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
+    if (ceFd.ok()) *_aidl_return += replace_emoji_fonts_in_dir(ceFd.get(), uid, srcFd, 0);
+    if (deFd.ok()) *_aidl_return += replace_emoji_fonts_in_dir(deFd.get(), uid, srcFd, 0);
+    if (!ceFd.ok()) return ok();
+
+    for (size_t i = 0; i < lockedParts.size(); i++) {
+        std::vector<std::string> parts = lockedParts[i];
+        std::string name = parts.back();
+        parts.pop_back();
+        unique_fd parentFd = open_app_subdir(ceFd.get(), parts, uid, /*create=*/true);
+        if (parentFd.ok() && lock_emoji_font(parentFd.get(), name, uid, srcFd)) {
+            (*_aidl_return)++;
+        } else {
+            PLOG(WARNING) << "Failed to lock emoji font " << lockedFiles[i] << " of "
+                          << packageName;
+        }
+    }
+    return ok();
+}
+
+binder::Status InstalldNativeService::removeAppEmojiFonts(
+        const std::optional<std::string>& uuid, const std::string& packageName, int32_t userId,
+        int32_t appId, const std::vector<std::string>& lockedFiles, int32_t* _aidl_return) {
+    ENFORCE_UID(AID_SYSTEM);
+    ENFORCE_VALID_USER(userId);
+    CHECK_ARGUMENT_UUID(uuid);
+    CHECK_ARGUMENT_PACKAGE_NAME(packageName);
+    // Only ordinary apps: system-uid data dirs are never touched.
+    CHECK_ARGUMENT_APP_ID(appId);
+    *_aidl_return = 0;
+
+    std::vector<std::vector<std::string>> lockedParts;
+    for (const auto& lockedFile : lockedFiles) {
+        std::vector<std::string> parts = split_app_relative_path(lockedFile);
+        if (parts.empty()) {
+            return exception(binder::Status::EX_ILLEGAL_ARGUMENT, "Bad path " + lockedFile);
+        }
+        lockedParts.push_back(std::move(parts));
+    }
+
+    LOCK_PACKAGE_USER();
+
+    const char* uuid_ = uuid ? uuid->c_str() : nullptr;
+    const char* pkgname = packageName.c_str();
+    const uid_t uid = multiuser_get_uid(userId, appId);
+
+    const std::string cePath = create_data_user_ce_package_path(uuid_, userId, pkgname);
+    const std::string dePath = create_data_user_de_package_path(uuid_, userId, pkgname);
+    unique_fd ceFd(open(cePath.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
+    unique_fd deFd(open(dePath.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
+    if (ceFd.ok()) *_aidl_return += remove_emoji_fonts_in_dir(ceFd.get(), uid, 0);
+    if (deFd.ok()) *_aidl_return += remove_emoji_fonts_in_dir(deFd.get(), uid, 0);
+    if (!ceFd.ok()) return ok();
+
+    // The root-owned copies made by lock_emoji_font. Only a root-owned regular file is removed,
+    // so a file the app wrote itself afterwards is left alone.
+    for (size_t i = 0; i < lockedParts.size(); i++) {
+        std::vector<std::string> parts = lockedParts[i];
+        std::string name = parts.back();
+        parts.pop_back();
+        unique_fd parentFd = open_app_subdir(ceFd.get(), parts, uid, /*create=*/false);
+        if (!parentFd.ok()) continue;
+        struct stat st;
+        if (fstatat(parentFd.get(), name.c_str(), &st, AT_SYMLINK_NOFOLLOW) < 0 ||
+            !S_ISREG(st.st_mode) || st.st_uid != AID_ROOT) {
+            continue;
+        }
+        if (unlinkat(parentFd.get(), name.c_str(), 0) == 0) {
+            (*_aidl_return)++;
+        } else {
+            PLOG(WARNING) << "Failed to unlock emoji font " << lockedFiles[i] << " of "
+                          << packageName;
+        }
+    }
+    return ok();
+}
+
+binder::Status InstalldNativeService::clearAppDataSubdir(const std::optional<std::string>& uuid,
+                                                         const std::string& packageName,
+                                                         int32_t userId, int32_t appId,
+                                                         const std::string& relativePath,
+                                                         bool block) {
+    ENFORCE_UID(AID_SYSTEM);
+    ENFORCE_VALID_USER(userId);
+    CHECK_ARGUMENT_UUID(uuid);
+    CHECK_ARGUMENT_PACKAGE_NAME(packageName);
+    CHECK_ARGUMENT_APP_ID(appId);
+
+    std::vector<std::string> parts = split_app_relative_path(relativePath);
+    if (parts.empty()) {
+        return exception(binder::Status::EX_ILLEGAL_ARGUMENT, "Bad path " + relativePath);
+    }
+    std::string name = parts.back();
+    parts.pop_back();
+
+    LOCK_PACKAGE_USER();
+
+    const char* uuid_ = uuid ? uuid->c_str() : nullptr;
+    const uid_t uid = multiuser_get_uid(userId, appId);
+    const std::string cePath = create_data_user_ce_package_path(uuid_, userId, packageName.c_str());
+    unique_fd ceFd(open(cePath.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
+    if (!ceFd.ok()) return error("Failed to open " + cePath);
+
+    unique_fd parentFd = open_app_subdir(ceFd.get(), parts, uid, block);
+    if (!parentFd.ok()) {
+        if (errno == ENOENT && !block) return ok();
+        return error("Failed to open parent of " + relativePath);
+    }
+    unique_fd targetFd(
+            openat(parentFd.get(), name.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
+    if (targetFd.ok()) {
+        if (delete_dir_contents_fd(parentFd.get(), name.c_str()) != 0) {
+            return error("Failed to clear " + relativePath);
+        }
+    } else if (errno != ENOENT) {
+        return error("Failed to open " + relativePath);
+    } else if (!block) {
+        return ok();
+    } else {
+        targetFd = make_app_dir(parentFd.get(), name, uid);
+        if (!targetFd.ok()) return error("Failed to create " + relativePath);
+    }
+
+    if (block) {
+        // root-owned 000: the app owns the dir otherwise and could simply chmod it back.
+        if (fchown(targetFd.get(), AID_ROOT, AID_ROOT) < 0 || fchmod(targetFd.get(), 0) < 0) {
+            return error("Failed to block " + relativePath);
+        }
+        return ok();
+    }
+
+    // Unblocking: hand a dir blocked by an earlier call back to the app.
+    struct stat st;
+    if (fstat(targetFd.get(), &st) < 0) return error("Failed to stat " + relativePath);
+    if (st.st_uid == AID_ROOT && (st.st_mode & 0777) == 0) {
+        if (fchown(targetFd.get(), uid, uid) < 0 || fchmod(targetFd.get(), 0700) < 0) {
+            return error("Failed to unblock " + relativePath);
+        }
+    }
+    return ok();
+}
+
 binder::Status InstalldNativeService::clearSdkSandboxDataPackageDirectory(
         const std::optional<std::string>& uuid, const std::string& packageName, int32_t userId,
         int32_t flags) {
@@ -2131,30 +2493,42 @@ binder::Status InstalldNativeService::tarAppData(const std::optional<std::string
 
     std::vector<char> ioBuf(65536);
 
+    uint32_t entryCount = 0;
+    uint64_t totalSize = 0;
     if (!extDirs.empty()) {
         static const char* kExtLabels[] = {"data", "obb", "media"};
         for (size_t i = 0; i < extDirs.size(); i++) {
             struct stat esb;
-            if (lstat(extDirs[i].c_str(), &esb) != 0 || !S_ISDIR(esb.st_mode)) continue;
+            if (lstat(extDirs[i].c_str(), &esb) != 0) {
+                if (errno == ENOENT) continue;
+                return error("tarAppData: cannot access " + extDirs[i]);
+            }
+            if (!S_ISDIR(esb.st_mode)) return error("tarAppData: invalid directory " + extDirs[i]);
+            if (++entryCount > kTarMaxEntries) return error("tarAppData: too many entries");
             if (!tarWriteHeader(fd, std::string(kExtLabels[i]) + "/", 0, '5', esb.st_mtime)) {
                 return error(StringPrintf("Failed to archive %s", extDirs[i].c_str()));
             }
-            const int rc = tarTree(fd, extDirs[i], kExtLabels[i], excludeCache, true, ioBuf);
+            const int rc = tarTree(fd, extDirs[i], kExtLabels[i], excludeCache, true, ioBuf,
+                                   entryCount, totalSize);
             if (rc != 0) {
-                return error(StringPrintf("Failed to archive %s: %s",
+                return error(-rc, StringPrintf("Failed to archive %s: %s",
                         extDirs[i].c_str(), strerror(-rc)));
             }
         }
     } else {
         struct stat sb;
-        if (lstat(dataDir.c_str(), &sb) == 0 && S_ISDIR(sb.st_mode)) {
-            const int rc = tarTree(fd, dataDir, "", excludeCache, true, ioBuf);
+        if (lstat(dataDir.c_str(), &sb) == 0) {
+            if (!S_ISDIR(sb.st_mode)) return error("tarAppData: invalid directory " + dataDir);
+            const int rc = tarTree(fd, dataDir, "", excludeCache, true, ioBuf,
+                                   entryCount, totalSize);
             if (rc != 0) {
-                return error(StringPrintf("Failed to archive %s: %s",
+                return error(-rc, StringPrintf("Failed to archive %s: %s",
                         dataDir.c_str(), strerror(-rc)));
             }
-        } else {
+        } else if (errno == ENOENT) {
             LOG(INFO) << "tarAppData: no data dir " << dataDir << "; writing empty archive";
+        } else {
+            return error("tarAppData: cannot access " + dataDir);
         }
     }
 
@@ -2167,27 +2541,43 @@ binder::Status InstalldNativeService::tarAppData(const std::optional<std::string
 }
 
 
-static uint64_t tarReadOctal(const char* field, size_t len) {
-    static const uint64_t kOctalOverflowSentinel = UINT64_MAX;
+static uint64_t tarReadNumber(const char* field, size_t len) {
+    if (len == 0) return UINT64_MAX;
     uint64_t val = 0;
+    const auto first = static_cast<unsigned char>(field[0]);
+    if ((first & 0x80) != 0) {
+        if ((first & 0x40) != 0) return UINT64_MAX;
+        val = first & 0x3f;
+        for (size_t i = 1; i < len; ++i) {
+            const auto digit = static_cast<unsigned char>(field[i]);
+            if (val > (UINT64_MAX - digit) / 256) return UINT64_MAX;
+            val = val * 256 + digit;
+        }
+        return val;
+    }
     size_t i = 0;
     while (i < len && (field[i] == ' ' || field[i] == '\0')) i++;
     for (; i < len && field[i] >= '0' && field[i] <= '7'; i++) {
         const uint64_t digit = field[i] - '0';
-        if (val > (UINT64_MAX - digit) / 8) return kOctalOverflowSentinel;
+        if (val > (UINT64_MAX - digit) / 8) return UINT64_MAX;
         val = val * 8 + digit;
+    }
+    for (; i < len; ++i) {
+        if (field[i] != ' ' && field[i] != '\0') return UINT64_MAX;
     }
     return val;
 }
 
 static bool tarSanitizeName(const char* raw, size_t maxLen, std::string* out) {
-    const size_t nameLen = strnlen(raw, maxLen);
-    std::string name(raw, nameLen);
-    while (!name.empty() && name[0] == '/') name.erase(name.begin());
+    if (maxLen == 0 || maxLen > kTarMaxPathBytes || raw[0] == '/' ||
+            memchr(raw, '\0', maxLen) != nullptr || memchr(raw, '\\', maxLen) != nullptr) {
+        return false;
+    }
+    std::string name(raw, maxLen);
     std::string result;
     for (const auto& seg : android::base::Split(name, "/")) {
         if (seg.empty() || seg == ".") continue;
-        if (seg == "..")               return false;
+        if (seg == ".." || seg.size() > NAME_MAX) return false;
         bool allDots = true;
         for (char c : seg) { if (c != '.') { allDots = false; break; } }
         if (allDots) return false;
@@ -2207,7 +2597,7 @@ static bool tarValidateHeader(const char hdr[512], std::string* outPath) {
         LOG(WARNING) << "tarRestore: invalid ustar magic/version in tar header";
         return false;
     }
-    unsigned int stored = (unsigned int)tarReadOctal(hdr + 148, 8);
+    const uint64_t stored = tarReadNumber(hdr + 148, 8);
     unsigned int computed = 0;
     for (int i = 0; i < 512; i++) {
         computed += (i >= 148 && i < 156)
@@ -2220,7 +2610,7 @@ static bool tarValidateHeader(const char hdr[512], std::string* outPath) {
         return false;
     }
     const std::string name(hdr,   strnlen(hdr,       100));
-    const std::string pfx (hdr + 345, strnlen(hdr + 345, 155));
+    const std::string pfx = posix ? std::string(hdr + 345, strnlen(hdr + 345, 155)) : "";
     *outPath = pfx.empty() ? name : (pfx + "/" + name);
     return true;
 }
@@ -2235,15 +2625,47 @@ static bool tarDrain(int fd, uint64_t count) {
     return true;
 }
 
+static int tarReadEntryHeader(int fd, char hdr[kTarBlock], std::string* outPath) {
+    if (!android::base::ReadFully(fd, hdr, kTarBlock)) return -1;
+    const auto isZero = [&] {
+        return std::all_of(hdr, hdr + kTarBlock, [](char c) { return c == 0; });
+    };
+    if (isZero()) {
+        return android::base::ReadFully(fd, hdr, kTarBlock) && isZero() ? 0 : -1;
+    }
+    if (!tarValidateHeader(hdr, outPath)) return -1;
+    if (hdr[156] == 'L') {
+        const uint64_t size = tarReadNumber(hdr + 124, 12);
+        if (size <= 1 || size > kTarMaxPathBytes + 1) return -1;
+        std::string name(size, '\0');
+        if (!android::base::ReadFully(fd, name.data(), size) || name.back() != '\0' ||
+                name.find('\0') != size - 1 ||
+                !tarDrain(fd, (kTarBlock - size % kTarBlock) % kTarBlock)) return -1;
+        name.pop_back();
+        if (!android::base::ReadFully(fd, hdr, kTarBlock) ||
+                !tarValidateHeader(hdr, outPath)) return -1;
+        *outPath = std::move(name);
+        if (hdr[156] != '0' && hdr[156] != '\0' && hdr[156] != '5') return -1;
+    }
+    std::string clean;
+    if (!tarSanitizeName(outPath->data(), outPath->size(), &clean)) return -1;
+    return 1;
+}
+
+static bool tarMkdirExternal(const std::string& path, uid_t mediaUid) {
+    if (mkdir(path.c_str(), 0771) != 0 && errno != EEXIST) return false;
+    unique_fd dir(open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW));
+    return dir.get() >= 0 && fchown(dir.get(), mediaUid, mediaUid) == 0;
+}
+
 static bool tarMkdirsExternal(const std::string& base, const std::string& rel, uid_t mediaUid) {
+    if (!tarMkdirExternal(base, mediaUid)) return false;
     std::string cur = base;
     for (const auto& seg : android::base::Split(rel, "/")) {
         if (seg.empty()) continue;
         cur += "/";
         cur += seg;
-        if (mkdir(cur.c_str(), 0771) == 0) {
-            lchown(cur.c_str(), mediaUid, mediaUid);
-        } else if (errno != EEXIST) {
+        if (!tarMkdirExternal(cur, mediaUid)) {
             PLOG(WARNING) << "tarMkdirsExternal: mkdir failed for " << cur;
             return false;
         }
@@ -2281,45 +2703,35 @@ binder::Status InstalldNativeService::untarAppDataExternal(
     uint32_t entryCount = 0;
     uint64_t totalExtracted = 0;
     while (true) {
-        if (!android::base::ReadFully(fd, hdr, kTarBlock)) break;
-        bool allZero = true;
-        for (size_t i = 0; i < kTarBlock; i++) { if (hdr[i]) { allZero = false; break; } }
-        if (allZero) break;
-
         std::string rawPath;
-        if (!tarValidateHeader(hdr, &rawPath)) {
-            return error("untarAppDataExternal: invalid tar header (bad magic or checksum)");
+        const int headerResult = tarReadEntryHeader(fd, hdr, &rawPath);
+        if (headerResult == 0) break;
+        if (headerResult < 0) {
+            return error("untarAppDataExternal: invalid or truncated tar header/path");
         }
         if (++entryCount > kTarMaxEntries) {
             return error(StringPrintf("untarAppDataExternal: exceeded max entry count (%u)",
                     kTarMaxEntries));
         }
 
-        const uint64_t size = tarReadOctal(hdr + 124, 12);
-        if (size == UINT64_MAX) {
-            return error("untarAppDataExternal: octal overflow in size field");
+        const uint64_t size = tarReadNumber(hdr + 124, 12);
+        if (size == UINT64_MAX || size > kTarMaxFileSize) {
+            return error("untarAppDataExternal: invalid tar size field");
         }
         const uint64_t padded = (size + kTarBlock - 1) & ~((uint64_t)kTarBlock - 1);
 
-#define DRAIN_OR_FAIL(label) \
-    if (!tarDrain(fd, padded)) return error(label ": truncated archive while skipping entry")
-
         std::string clean;
         if (!tarSanitizeName(rawPath.c_str(), rawPath.size(), &clean)) {
-            DRAIN_OR_FAIL("untarAppDataExternal");
-            continue;
-        }
-        if (size > kTarMaxFileSize) {
-            LOG(WARNING) << "untarAppDataExternal: skipping oversized entry " << clean
-                         << " (" << size << " bytes)";
-            DRAIN_OR_FAIL("untarAppDataExternal");
-            continue;
+            return error("untarAppDataExternal: invalid tar path");
         }
         if (size > kTarMaxTotalSize - totalExtracted) {
             return error(StringPrintf("untarAppDataExternal: total extracted size would exceed "
                     "limit (%" PRIu64 " bytes)", kTarMaxTotalSize));
         }
         const char type = hdr[156];
+        if ((type != '0' && type != '\0' && type != '5') || (type == '5' && size != 0)) {
+            return error("untarAppDataExternal: unsupported tar entry");
+        }
 
         const auto segs = android::base::Split(clean, "/");
         const std::string& top = segs[0];
@@ -2327,7 +2739,7 @@ binder::Status InstalldNativeService::untarAppDataExternal(
         if      (top == "data")  { root = dataRoot;  }
         else if (top == "obb")   { root = obbRoot;   }
         else if (top == "media") { root = mediaRoot; }
-        else { DRAIN_OR_FAIL("untarAppDataExternal"); continue; }
+        else { return error("untarAppDataExternal: invalid external data root"); }
 
         std::string rest;
         for (size_t i = 1; i < segs.size(); i++) {
@@ -2337,49 +2749,37 @@ binder::Status InstalldNativeService::untarAppDataExternal(
         }
         std::string dest = rest.empty() ? root : (root + "/" + rest);
         while (!dest.empty() && dest.back() == '/') dest.pop_back();
+        if (dest.size() >= PATH_MAX) {
+            return error("untarAppDataExternal: path exceeds the filesystem limit");
+        }
 
         if (type == '5') {
-            if (!rest.empty() && !tarMkdirsExternal(root, rest, mediaUid)) {
+            if (!tarMkdirsExternal(root, rest, mediaUid)) {
                 return error(StringPrintf("untarAppDataExternal: mkdir failed for %s",
                         dest.c_str()));
-            } else if (rest.empty()) {
-                if (mkdir(root.c_str(), 0771) == 0) {
-                    lchown(root.c_str(), mediaUid, mediaUid);
-                } else if (errno != EEXIST) {
-                    return error(StringPrintf("untarAppDataExternal: mkdir root failed for %s",
-                            root.c_str()));
-                }
             }
         } else if (type == '0' || type == '\0') {
             if (!rest.empty()) {
                 const size_t slash = rest.find_last_of('/');
                 if (slash != std::string::npos) {
                     if (!tarMkdirsExternal(root, rest.substr(0, slash), mediaUid)) {
-                        PLOG(WARNING) << "untarAppDataExternal: mkdir failed for parent of "
-                                      << dest << "; skipping file";
-                        DRAIN_OR_FAIL("untarAppDataExternal");
-                        continue;
+                        return error("untarAppDataExternal: cannot create parent of " + dest);
                     }
                 } else {
-                    if (mkdir(root.c_str(), 0771) != 0 && errno != EEXIST) {
-                        DRAIN_OR_FAIL("untarAppDataExternal");
-                        continue;
+                    if (!tarMkdirExternal(root, mediaUid)) {
+                        return error("untarAppDataExternal: cannot create " + root);
                     }
                 }
             }
             unique_fd out(open(dest.c_str(),
                     O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0660));
             if (out.get() < 0) {
-                PLOG(WARNING) << "untarAppDataExternal: open failed for " << dest;
-                DRAIN_OR_FAIL("untarAppDataExternal");
-                continue;
+                return error("untarAppDataExternal: cannot open " + dest);
             }
             {
                 struct stat outSb;
                 if (fstat(out.get(), &outSb) != 0 || !S_ISREG(outSb.st_mode)) {
-                    PLOG(WARNING) << "untarAppDataExternal: fd not a regular file: " << dest;
-                    DRAIN_OR_FAIL("untarAppDataExternal");
-                    continue;
+                    return error("untarAppDataExternal: not a regular file: " + dest);
                 }
             }
             uint64_t remaining = size;
@@ -2397,14 +2797,12 @@ binder::Status InstalldNativeService::untarAppDataExternal(
             if (!tarDrain(fd, padded - size)) {
                 return error("untarAppDataExternal: truncated archive after file body");
             }
-            fchown(out.get(), mediaUid, mediaUid);
-            fchmod(out.get(), 0660);
+            if (fchown(out.get(), mediaUid, mediaUid) != 0 || fchmod(out.get(), 0660) != 0) {
+                return error("untarAppDataExternal: cannot set ownership or mode for " + dest);
+            }
             totalExtracted += size;
-        } else {
-            DRAIN_OR_FAIL("untarAppDataExternal");
         }
     }
-#undef DRAIN_OR_FAIL
 
     return ok();
 }
@@ -2419,10 +2817,9 @@ static bool tarMkdirsInternal(const std::string& base, const std::string& rel, u
         cur += seg;
         if (mkdir(cur.c_str(), 0700) == 0) {
             unique_fd dfd(open(cur.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW));
-            if (dfd.get() >= 0) {
-                fchown(dfd.get(), uid, uid);
-            } else {
+            if (dfd.get() < 0 || fchown(dfd.get(), uid, uid) != 0) {
                 PLOG(WARNING) << "untarAppData: open dir for chown failed: " << cur;
+                return false;
             }
         } else if (errno == EEXIST) {
             struct stat sb;
@@ -2482,50 +2879,43 @@ binder::Status InstalldNativeService::untarAppData(
     uint32_t entryCount = 0;
     uint64_t totalExtracted = 0;
     while (true) {
-        if (!android::base::ReadFully(fd, hdr, kTarBlock)) break;
-        bool allZero = true;
-        for (size_t i = 0; i < kTarBlock; i++) { if (hdr[i]) { allZero = false; break; } }
-        if (allZero) break;
-
         std::string rawPath;
-        if (!tarValidateHeader(hdr, &rawPath)) {
-            return error("untarAppData: invalid tar header (bad magic or checksum)");
+        const int headerResult = tarReadEntryHeader(fd, hdr, &rawPath);
+        if (headerResult == 0) break;
+        if (headerResult < 0) {
+            return error("untarAppData: invalid or truncated tar header/path");
         }
         if (++entryCount > kTarMaxEntries) {
             return error(StringPrintf("untarAppData: exceeded max entry count (%u)",
                     kTarMaxEntries));
         }
 
-        const uint64_t size = tarReadOctal(hdr + 124, 12);
-        if (size == UINT64_MAX) {
-            return error("untarAppData: octal overflow in size field");
+        const uint64_t size = tarReadNumber(hdr + 124, 12);
+        if (size == UINT64_MAX || size > kTarMaxFileSize) {
+            return error("untarAppData: invalid tar size field");
         }
         const uint64_t padded = (size + kTarBlock - 1) & ~((uint64_t)kTarBlock - 1);
 
-#define DRAIN_OR_FAIL(label) \
-    if (!tarDrain(fd, padded)) return error(label ": truncated archive while skipping entry")
-
         std::string clean;
         if (!tarSanitizeName(rawPath.c_str(), rawPath.size(), &clean)) {
-            DRAIN_OR_FAIL("untarAppData");
-            continue;
-        }
-        if (size > kTarMaxFileSize) {
-            LOG(WARNING) << "untarAppData: skipping oversized entry " << clean
-                         << " (" << size << " bytes)";
-            DRAIN_OR_FAIL("untarAppData");
-            continue;
+            return error("untarAppData: invalid tar path");
         }
         if (size > kTarMaxTotalSize - totalExtracted) {
             return error(StringPrintf("untarAppData: total extracted size would exceed "
                     "limit (%" PRIu64 " bytes)", kTarMaxTotalSize));
         }
         const char type = hdr[156];
+        if ((type != '0' && type != '\0' && type != '5') || (type == '5' && size != 0)) {
+            return error("untarAppData: unsupported tar entry");
+        }
 
         while (!clean.empty() && clean.back() == '/') clean.pop_back();
-        if (clean.empty()) { DRAIN_OR_FAIL("untarAppData"); continue; }
+        if (clean.empty()) return error("untarAppData: empty tar path");
 
         const std::string dest = base + "/" + clean;
+        if (dest.size() >= PATH_MAX) {
+            return error("untarAppData: path exceeds the filesystem limit");
+        }
 
         if (type == '5') {
             if (!tarMkdirsInternal(base, clean, uid)) {
@@ -2541,16 +2931,12 @@ binder::Status InstalldNativeService::untarAppData(
             unique_fd out(open(dest.c_str(),
                     O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600));
             if (out.get() < 0) {
-                PLOG(WARNING) << "untarAppData: open failed for " << dest << ", skipping";
-                DRAIN_OR_FAIL("untarAppData");
-                continue;
+                return error("untarAppData: cannot open " + dest);
             }
             {
                 struct stat outSb;
                 if (fstat(out.get(), &outSb) != 0 || !S_ISREG(outSb.st_mode)) {
-                    PLOG(WARNING) << "untarAppData: fd not a regular file: " << dest;
-                    DRAIN_OR_FAIL("untarAppData");
-                    continue;
+                    return error("untarAppData: not a regular file: " + dest);
                 }
             }
             uint64_t remaining = size;
@@ -2567,13 +2953,12 @@ binder::Status InstalldNativeService::untarAppData(
             if (!tarDrain(fd, padded - size)) {
                 return error("untarAppData: truncated archive after file body");
             }
-            fchown(out.get(), uid, uid);
+            if (fchown(out.get(), uid, uid) != 0) {
+                return error("untarAppData: cannot set ownership for " + dest);
+            }
             totalExtracted += size;
-        } else {
-            DRAIN_OR_FAIL("untarAppData");
         }
     }
-#undef DRAIN_OR_FAIL
 
     LOCK_PACKAGE_USER();
     return restoreconAppDataLocked(uuid, packageName, userId, storageFlags, appId, seInfo);
